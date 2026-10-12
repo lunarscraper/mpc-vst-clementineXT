@@ -1,0 +1,34 @@
+# Build Clementine-XT for the Force (armv7) and attach the install zip to a DRAFT release in this repo.
+# Run it from the Actions tab: "Clementine-XT release" -> Run workflow -> enter the version (e.g. 0.9.6).
+# The zip is also kept as a run artifact for 14 days.
+name: Clementine-XT release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version, e.g. 0.9.6
+        required: true
+        default: 0.9.6
+      dry_run:
+        description: Only build the zip (run artifact), no draft release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: sd88me/mpc-vst-plugins/.github/workflows/vst-release.yml@36f3fba254387b4ae6fbbc661e5dcff038fc37ce
+    with:
+      tools_ref: 36f3fba254387b4ae6fbbc661e5dcff038fc37ce
+      tag: clementine-xt-v${{ inputs.version }}
+      version: ${{ inputs.version }}
+      vst_dir: vst
+      build: '"$MPC_VST/tools/build_port.sh" vst/vst.json armv7'
+      user_data: ROMS
+      license: GPL-3.0-only
+      plugin_id: clementine-xt
+      about: Wavetable synthesizer modelled on the Microwave II/XT, with your own ROM.
+      dry_run: ${{ inputs.dry_run }}
