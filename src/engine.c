@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <strings.h>
 #include "engine.h"
@@ -20,6 +21,12 @@
 #include "mod.h"
 
 #define NV 10
+/* Fade-out slots: a voice that is taken over while still audible (voice stealing, mono/unison restarts, a "normal" envelope retrigger)
+ * is copied here and faded to zero over FADE_N core samples instead of being cut. A hard cut of a sounding voice is a click; a
+ * sequencer driving the sound (Euclidier, Cadenza, ...) steals voices on nearly every step, so the clicks turned into crackle. */
+#define NG 10
+#define FADE_N 160   /* 4 ms at 40 kHz */
+#define FADE_MIN 0.0005f   /* below this envelope level a cut is inaudible: no fade needed */
 #define CORE_HZ 40000.0f
 
 typedef struct { float x1, y1; } shelf_t;
@@ -55,6 +62,8 @@ typedef struct {
     wavedata_t *wd;
     const table_t *tab;
     voice_t v[NV];
+    voice_t g[NG];               /* fading copies of taken-over voices (only the part up to dly is copied) */
+    int gfade[NG];               /* samples left in each fade, 0 = slot free */
     shelf_t shelf[2];
     fx_t fx;
     uint8_t cc[128];             /* last value of each MIDI controller (mod wheel 1, breath 2, foot 4, ...) */
@@ -221,11 +230,22 @@ static int steal_voice(inst_t *s) {
     return best;
 }
 
+/* Hand a still-sounding voice to a fade slot before it is restarted. The control-rate values are frozen (the copy keeps the last ones). */
+static void fade_out(inst_t *s, const voice_t *v) {
+    if (v->aenv.level <= FADE_MIN) return;
+    int k = 0;
+    for (int i = 0; i < NG; i++) { if (!s->gfade[i]) { k = i; break; } if (s->gfade[i] < s->gfade[k]) k = i; }   /* a free slot, else the one closest to silence */
+    memcpy(&s->g[k], v, offsetof(voice_t, dly));
+    s->g[k].ctl = 1 << 30;
+    s->gfade[k] = FADE_N;
+}
+
 static void start_voice(inst_t *s, int idx, int note, int vel, float det, float panoff, int legato, int nvoices) {
     voice_t *v = &s->v[idx];
     const patch_t *p = &s->cur;
     int gl = p->d[P_GLIDE_ON] && (p->d[P_GLIDE_TYPE] < 2 || legato);   /* types 2 and 3 (fingered) glide only on legato notes */
     float from = legato || (gl && s->last_pitch > 0) ? (legato ? v->pitch : s->last_pitch) : (float)note;
+    fade_out(s, v);
     memset(v, 0, sizeof *v);
     v->key = note; v->on = 1; v->vel = vel; v->det = det; v->panoff = panoff;
     v->ug = nvoices <= 1 ? 1.0f : 1.0f - 0.015f * (nvoices - 2);   /* stacked voices keep nearly full level each (firmware, factory-sound comparison: dual 1.4-1.7x, unison about 2.8x one voice, summing incoherently) */
@@ -267,7 +287,7 @@ static void assign_voices(inst_t *s, int retrigger_new) {
                 if (retrigger_new) {   /* per envelope: normal restarts from zero, single leaves it running, retrigger restarts from the current level */
                     voice_t *w = &s->v[i];
                     int ta = p->d[123], tf = p->d[117], tw = p->d[141], tr = p->d[157];
-                    if (ta != 1) { if (ta == 0) w->aenv.level = 0; w->aenv.stage = ST_ATT; }
+                    if (ta != 1) { if (ta == 0) { fade_out(s, w); w->aenv.level = 0; } w->aenv.stage = ST_ATT; }
                     if (tf != 1) { if (tf == 0) w->fenv.level = 0; w->fenv.stage = ST_ATT; }
                     if (tw == 0) memset(&w->wenv, 0, sizeof w->wenv); else if (tw == 2) { w->wenv.phase = 0; w->wenv.seg = 0; w->wenv.timer = 0; }
                     if (tr == 0) memset(&w->fren, 0, sizeof w->fren); else if (tr == 2) { w->fren.phase = 0; w->fren.seg = 0; w->fren.timer = 0; }
@@ -800,6 +820,31 @@ static void voice_control(inst_t *s, voice_t *v) {
     v->panl = pan_gain_left(pi); v->panr = pan_gain_left(127 - pi);
 }
 
+/* One core sample of one voice, added to suml/sumr with an extra gain gm (the fade of a taken-over voice). */
+static inline void voice_run(inst_t *s, voice_t *v, const patch_t *p, float gm, float *suml, float *sumr) {
+    if (v->ctl <= 0) { voice_control(s, v); v->ctl = CTL_N; }
+    v->ctl--;
+    env_step(&v->aenv, v->aa, v->ad, v->as, v->ar);
+    env_step(&v->fenv, v->fa, v->fd, v->fs, v->fr);
+    glide_step(v, p);
+    float w2 = osc_read_lf(s->tab->mip[v->slot2], v->ph2, v->lf2);
+    /* Oscillator FM (measured): oscillator 2 scales oscillator 1's frequency by (1 + k*w2) with k = 0.085*(amount/16)^2.8 (sidebands within 3%; the carrier level depends on start phases and is not matched);
+     * the sidebands fall as 1/(modulator/carrier ratio), so it is frequency (not phase) modulation. */
+    float hz1m = v->fm_on ? v->hz1 * (1.0f + v->fmk * w2) : v->hz1;
+    float w1 = v->fm_on ? osc_read(s->tab->mip[v->slot1], v->ph1, fabsf(hz1m)) : osc_read_lf(s->tab->mip[v->slot1], v->ph1, v->lf1);
+    v->ph1 += 128.0f * hz1m / CORE_HZ;
+    if (v->ph1 < 0) v->ph1 += 128;
+    if (v->ph1 >= 128) { v->ph1 -= 128; if (p->d[P_OSC2_SYNC]) v->ph2 = start_phase(p->d[P_W2_PHASE]); }
+    v->ph2 += 128.0f * v->hz2 / CORE_HZ; if (v->ph2 >= 128) v->ph2 -= 128;
+    float mix = (w1 * v->m1 + w2 * v->m2 + w1 * w2 * v->m3 + (v->m4 > 0 ? noise_tick(v) * v->m4 : 0.0f)) / 128.0f;
+    mix = clip(mix, p->d[P_CLIP]);
+    float fl = filter1_run(&v->flt, p->d[P_F1_TYPE], mix, p->d[P_F1_TYPE] == 8 ? v->cut + w2 * v->spec * 1.4f : v->cut, v->reso, v->spec);   /* type 8: oscillator 2 moves the cutoff by +-1.4 units per Special step (fitted) */
+    fl = filter2_run(&v->flt, p->d[P_F2_TYPE], fl, v->c2);
+    float g = fl * v->aenv.level * v->gfac * gm;
+    *suml += g * v->panl;
+    *sumr += g * v->panr;
+}
+
 static void core(inst_t *s, float *lr) {
     arp_tick(s);
     const patch_t *p = &s->cur;
@@ -813,27 +858,12 @@ static void core(inst_t *s, float *lr) {
         voice_t *v = &s->v[i];
         if (v->aenv.stage == ST_REL && v->aenv.level <= 0) v->on = 0;
         if (!v->on && v->aenv.level == 0) continue;
-        if (v->ctl <= 0) { voice_control(s, v); v->ctl = CTL_N; }
-        v->ctl--;
-        env_step(&v->aenv, v->aa, v->ad, v->as, v->ar);
-        env_step(&v->fenv, v->fa, v->fd, v->fs, v->fr);
-        glide_step(v, p);
-        float w2 = osc_read_lf(s->tab->mip[v->slot2], v->ph2, v->lf2);
-        /* Oscillator FM (measured): oscillator 2 scales oscillator 1's frequency by (1 + k*w2) with k = 0.085*(amount/16)^2.8 (sidebands within 3%; the carrier level depends on start phases and is not matched);
-         * the sidebands fall as 1/(modulator/carrier ratio), so it is frequency (not phase) modulation. */
-        float hz1m = v->fm_on ? v->hz1 * (1.0f + v->fmk * w2) : v->hz1;
-        float w1 = v->fm_on ? osc_read(s->tab->mip[v->slot1], v->ph1, fabsf(hz1m)) : osc_read_lf(s->tab->mip[v->slot1], v->ph1, v->lf1);
-        v->ph1 += 128.0f * hz1m / CORE_HZ;
-        if (v->ph1 < 0) v->ph1 += 128;
-        if (v->ph1 >= 128) { v->ph1 -= 128; if (p->d[P_OSC2_SYNC]) v->ph2 = start_phase(p->d[P_W2_PHASE]); }
-        v->ph2 += 128.0f * v->hz2 / CORE_HZ; if (v->ph2 >= 128) v->ph2 -= 128;
-        float mix = (w1 * v->m1 + w2 * v->m2 + w1 * w2 * v->m3 + (v->m4 > 0 ? noise_tick(v) * v->m4 : 0.0f)) / 128.0f;
-        mix = clip(mix, p->d[P_CLIP]);
-        float fl = filter1_run(&v->flt, p->d[P_F1_TYPE], mix, p->d[P_F1_TYPE] == 8 ? v->cut + w2 * v->spec * 1.4f : v->cut, v->reso, v->spec);   /* type 8: oscillator 2 moves the cutoff by +-1.4 units per Special step (fitted) */
-        fl = filter2_run(&v->flt, p->d[P_F2_TYPE], fl, v->c2);
-        float g = fl * v->aenv.level * v->gfac;
-        suml += g * v->panl;
-        sumr += g * v->panr;
+        voice_run(s, v, p, 1.0f, &suml, &sumr);
+    }
+    for (int i = 0; i < NG; i++) {   /* taken-over voices fading out (linear, FADE_N samples) */
+        if (!s->gfade[i]) continue;
+        voice_run(s, &s->g[i], p, (float)s->gfade[i] / (FADE_N + 1), &suml, &sumr);
+        s->gfade[i]--;
     }
     float l = suml * OUT_GAIN, r = sumr * OUT_GAIN;
     /* Effect index order follows the manual's list for 0..9 (the firmware's real numbering is to be confirmed); others are off. */

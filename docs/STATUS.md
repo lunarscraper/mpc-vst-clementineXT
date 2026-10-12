@@ -40,3 +40,8 @@ gcc -O1 -Wall -fsanitize=address,undefined -o test/test_waves test/test_waves.c 
 `tools/oracle/` is a dev-only harness that runs the original firmware (through a local gearmulator checkout and your own ROM) to
 measure it; it is never shipped and its output stays off the repo (see `docs/DESIGN.md` section 4 and `tools/oracle/oracle.cpp`).
 
+## 0.9.6 (2026-10-12)
+
+- Voices taken over while still sounding (voice stealing, mono and unison restarts, a "normal" envelope retrigger) fade out over 4 ms
+  in one of 10 fade slots instead of being cut. Driven by a sequencer plugin (Euclidier, Cadenza, ...) the sound stole a voice on
+  nearly every step, and the hard cuts crackled; played from the pads it rarely ran out of voices. Test: `test/test_steal.c`.
